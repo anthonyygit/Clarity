@@ -1,0 +1,59 @@
+{
+  "commands": [
+    {
+      "name": "command1",
+      "description": "A test command that prints a greeting on the glasses.",
+      "trigger": "When the user asks to run command 1, cmd 1, the first command, or a test command."
+    },
+    {
+      "name": "take_photo",
+      "description": "Takes a photo with the glasses camera and saves it to the server.",
+      "trigger": "When the user asks to take a photo, take a picture, snap a pic, or save an image."
+    },
+    {
+      "name": "describe_scene",
+      "description": "Takes a photo and speaks a description of what is in front of the user.",
+      "trigger": "When the user asks what's in front of them, what do you see, describe the scene, what am I looking at, where am I, or anything about their surroundings."
+    },
+    {
+      "name": "read_text",
+      "description": "Takes a photo and reads aloud any text in it (books, signs, labels, screens, documents).",
+      "trigger": "When the user asks to read something to them: read this, what does this say, read the page, read the sign, read the label, what's written here, or similar."
+    },
+    {
+      "name": "start_task",
+      "description": "Starts a guided, step-by-step walkthrough of a multistep physical task, speaking one step at a time and waiting for the user to say they're done before continuing.",
+      "trigger": "When the user asks for help doing a multistep real-world task, e.g. 'help me cook an egg', 'help me organize my bookshelf', 'walk me through making coffee', 'how do I set up this lamp', or anything phrased as wanting guided step-by-step help."
+    },
+    {
+      "name": "volume_up",
+      "description": "Increases the glasses' speaker volume by one step and remembers it for next time.",
+      "trigger": "When the user asks to turn the volume up, speak louder, increase the volume, or similar."
+    },
+    {
+      "name": "volume_down",
+      "description": "Decreases the glasses' speaker volume by one step and remembers it for next time.",
+      "trigger": "When the user asks to turn the volume down, speak quieter/softer, lower the volume, or similar."
+    },
+    {
+      "name": "volume_max",
+      "description": "Sets the glasses' speaker volume to the maximum and remembers it for next time.",
+      "trigger": "When the user asks for max/maximum/full volume, the loudest it can go, or 'as high as it goes'."
+    },
+    {
+      "name": "volume_min",
+      "description": "Sets the glasses' speaker volume to the minimum and remembers it for next time.",
+      "trigger": "When the user asks for min/minimum volume, to mute it, or 'as low as it goes'."
+    },
+    {
+      "name": "speed_up",
+      "description": "Makes the spoken responses talk faster and remembers it for next time.",
+      "trigger": "When the user asks to talk faster, speed up, hurry up the speech, or similar."
+    },
+    {
+      "name": "speed_down",
+      "description": "Makes the spoken responses talk slower and remembers it for next time.",
+      "trigger": "When the user asks to talk slower, slow down the speech, or similar."
+    }
+  ]
+}
