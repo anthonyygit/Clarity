@@ -7,11 +7,11 @@ for p in ("/src", "/src/lib"):
         sys.path.append(p)
 
 from config import BACKEND_URL
-from camera import get_camera
+from camera import get_camera_hires
 
 
 def run():
-    cam = get_camera()
+    cam = get_camera_hires()
     gc.collect()
     jpg = cam.capture()
     print("describe_scene: captured %d bytes" % len(jpg))

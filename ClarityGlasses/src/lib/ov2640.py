@@ -38,6 +38,7 @@ class ov2640:
         self.i2c.writeto_mem(SENSORADDR, 0x15, b"\x00")
 
         cam_write_register_set(self.i2c, SENSORADDR, resolution)
+        self.resolution = resolution
 
         self.i2c.writeto_mem(SENSORADDR, 0xFF, b"\x00")
         self.i2c.writeto_mem(SENSORADDR, 0x44, bytes([jpeg_quality]))
@@ -51,6 +52,19 @@ class ov2640:
         pid = self.i2c.readfrom_mem(SENSORADDR, 0x0A, 1)
         ver = self.i2c.readfrom_mem(SENSORADDR, 0x0B, 1)
         print("ov2640: sensor id %s %s" % (pid.hex(), ver.hex()))
+
+    def set_resolution(self, resolution):
+        """Reconfigure the sensor's output resolution on an already-running
+        camera — same register-write sequence __init__ already does for
+        this one step, just re-run standalone. No SPI/pin setup or sensor
+        re-verification, so this is fast and safe to call repeatedly."""
+        if resolution is self.resolution:
+            return
+        self.i2c.writeto_mem(SENSORADDR, 0xFF, b"\x01")
+        self.i2c.writeto_mem(SENSORADDR, 0x15, b"\x00")
+        cam_write_register_set(self.i2c, SENSORADDR, resolution)
+        self.i2c.writeto_mem(SENSORADDR, 0xFF, b"\x00")
+        self.resolution = resolution
 
     def _wr(self, addr, val):
         self.cs.off()

@@ -7,11 +7,13 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
+import anthropic
 from anthropic import Anthropic
 from elevenlabs.client import ElevenLabs
 from PIL import Image
 import io
 from deepgram import DeepgramClient
+from groq import Groq
 import threading
 import time
 
@@ -59,7 +61,7 @@ def save_settings(settings: dict):
         json.dump(settings, f)
 
 
-speech_speed = load_settings().get("speed", 1.0)
+speech_speed = min(max(load_settings().get("speed", 1.0), SPEED_MIN), SPEED_MAX)
 
 
 def adjust_speech_speed(delta: float) -> float:
@@ -82,6 +84,12 @@ _SETTINGS_PHRASES = (
                       "quieter", "softer", "decrease the volume", "lower the volume")),
     ("speed_up", ("talk faster", "speak faster", "speed up", "faster please")),
     ("speed_down", ("talk slower", "speak slower", "slow down", "slower please")),
+    ("walk_interval_3", ("interval to 3 seconds", "interval 3 seconds", "every 3 seconds",
+                          "walking interval 3", "check every 3 seconds")),
+    ("walk_interval_5", ("interval to 5 seconds", "interval 5 seconds", "every 5 seconds",
+                          "walking interval 5", "check every 5 seconds")),
+    ("walk_interval_ondemand", ("only when needed", "on demand", "as needed",
+                                 "walking interval on demand", "only tell me when needed")),
 )
 
 
@@ -96,6 +104,7 @@ def match_settings_command(transcript: str):
 anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
 elevenlabs_api_key = os.getenv("ELEVENLABS_API_KEY")
 deepgram_api_key = os.getenv("DEEPGRAM_API_KEY")
+groq_api_key = os.getenv("GROQ_API_KEY")
 
 if not anthropic_api_key:
     raise ValueError("ANTHROPIC_API_KEY environment variable not set")
@@ -103,6 +112,11 @@ if not elevenlabs_api_key:
     raise ValueError("ELEVENLABS_API_KEY environment variable not set")
 if not deepgram_api_key:
     raise ValueError("DEEPGRAM_API_KEY environment variable not set")
+
+# Optional — only used to speed up walking mode's hazard checks. Not
+# required at startup like the others, since /walk/tick falls back to
+# Claude automatically if this isn't set or a call to it fails.
+groq_client = Groq(api_key=groq_api_key) if groq_api_key else None
 
 audio_buffer = bytearray()
 buffer_lock = threading.Lock()
@@ -259,6 +273,102 @@ SCENE_PROMPT = (
 OCR_PROMPT = ("Extract and read all the text you see in this image. If there is no text, say 'I don't see any text infront of you.'"
               "If the user is requesting you to read a book, then just start reading to them at a normal pace. Pretend you are the user's eyes, as this is meant as a visibility device for the blind."
               "If the book is open so you can see both pages, start from the top left of the left page, so like the first character, and read on from there as a normal person would.")
+
+WALKING_PROMPT = (
+    "You are narrating a live camera feed for a blind person who is actively "
+    "walking, so they don't step into danger. Check these categories in "
+    "order, and alert on the FIRST one that applies — do not default to "
+    "'clear' unless you have genuinely checked all of them and none apply:\n"
+    "1. Roads/vehicles: a street, driveway, crosswalk, parking lot, railroad "
+    "tracks, or any moving car, bike, scooter, motorcycle, or bus ahead of "
+    "them. e.g. 'street ahead', 'car approaching', 'bike coming'.\n"
+    "2. Anything that could directly injure them: a knife, axe, blade, gun, "
+    "power tool, chainsaw, fire, flame, smoke, exposed wiring, a sparking "
+    "outlet, broken glass, or any weapon or sharp object visible anywhere "
+    "in frame — whether or not it's directly in their path, and whether or "
+    "not anyone is holding it. As urgent as roads/vehicles. e.g. 'knife on "
+    "the counter', 'fire ahead', 'broken glass on the ground'.\n"
+    "3. Animals: a dog (especially loose or aggressive-looking), or any "
+    "other animal in their path.\n"
+    "4. Elevation and surface hazards: stairs up or down, curbs, "
+    "drop-offs, steep ramps, potholes, an open manhole or hole, uneven or "
+    "broken pavement, a wet floor, a spill, ice, or standing water.\n"
+    "5. Overhead hazards: low-hanging branches, awnings, scaffolding, "
+    "signs, or a door frame low enough to hit their head.\n"
+    "6. Temporary or construction hazards: cones, barriers, caution tape, "
+    "a ladder, construction equipment, or wet paint.\n"
+    "7. Trip/collision hazards directly in their path: poles, furniture, "
+    "trash cans, cords or cables on the ground, an open door, a glass "
+    "door, or people.\n"
+    "Always name the specific thing, never say a vague word like 'obstacle', "
+    "'object', or 'something' — say what it actually is, e.g. 'trash can "
+    "ahead', 'low branch', 'person on your left', 'stairs down', 'wire "
+    "hanging'. If you genuinely can't tell what it is, describe it visually "
+    "instead of using a placeholder word, e.g. 'dark shape on the ground' "
+    "or 'thin wire hanging' — still concrete, just honest about the "
+    "uncertainty. "
+    "Respond in one short phrase, under 8 words, no greetings, no filler, "
+    "no full sentences — just the alert itself. "
+    "Only say exactly 'clear' if you have checked all the categories above "
+    "and nothing in any of them is visible."
+)
+
+def _describe_hazard_groq(image_b64: str, media_type: str) -> str:
+    completion = groq_client.chat.completions.create(
+        model="meta-llama/llama-4-scout-17b-16e-instruct",
+        max_tokens=60,
+        messages=[
+            {"role": "system", "content": WALKING_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{media_type};base64,{image_b64}"},
+                    },
+                ],
+            },
+        ],
+    )
+    return (completion.choices[0].message.content or "").strip()
+
+
+def _describe_hazard_claude(image_b64: str, media_type: str) -> str:
+    message = anthropic_client.messages.create(
+        model="claude-sonnet-5",
+        max_tokens=60,
+        system=WALKING_PROMPT,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": media_type,
+                            "data": image_b64,
+                        },
+                    },
+                ],
+            }
+        ],
+    )
+    return next((b.text for b in message.content if b.type == "text"), "").strip()
+
+
+def describe_walking_frame(image_b64: str, media_type: str) -> str:
+    """Groq first — its LPU inference is dramatically faster than Claude for
+    a short-output task like this, and walking mode is latency-sensitive by
+    nature. Falls back to Claude automatically if Groq isn't configured or
+    the call fails, so walking mode never just goes silent because one
+    provider had an issue."""
+    if groq_client is not None:
+        try:
+            return _describe_hazard_groq(image_b64, media_type)
+        except Exception as e:
+            print(f"walk tick: Groq failed, falling back to Claude: {e}")
+    return _describe_hazard_claude(image_b64, media_type)
 
 
 def load_commands() -> list:
@@ -712,6 +822,13 @@ async def transcribe_done():
                         "volume_max": "Cranking it all the way up.",
                         "volume_min": "Turning it all the way down.",
                     }[settings_command]
+                elif settings_command in ("walk_interval_3", "walk_interval_5", "walk_interval_ondemand"):
+                    command = settings_command
+                    response_text = {
+                        "walk_interval_3": "Okay, checking every 3 seconds.",
+                        "walk_interval_5": "Okay, checking every 5 seconds.",
+                        "walk_interval_ondemand": "Okay, I'll only speak up when something changes.",
+                    }[settings_command]
                 elif active_task is not None:
                     response_text = continue_task(transcript)
                 else:
@@ -811,6 +928,96 @@ async def scene_from_glasses(request: Request):
     except Exception as e:
         print(f"Error in /scene/raw: {e}")
         raise HTTPException(status_code=500, detail={"error": str(e)})
+
+
+@app.post("/walk/tick")
+async def walk_tick(request: Request):
+    """
+    One tick of walking-mode narration: raw JPEG in, audio out — directly,
+    in this same response, not via the pending_response_text + a follow-up
+    GET /response/latest fetch. That two-round-trip pattern is fine for
+    regular commands but too slow for a safety-relevant "street ahead"
+    alert, so this streams the TTS audio straight back here instead.
+
+    Only a 'clear' result gets suppressed — a real hazard is always spoken,
+    every tick, even if it's the same one as last time, since a persistent
+    hazard is exactly when repetition is wanted, not when it should go quiet.
+    """
+    t_start = time.time()
+
+    try:
+        image_data = await request.body()
+        if not image_data:
+            raise HTTPException(status_code=400, detail="Empty image")
+        t_received = time.time()
+        print(f"walk tick: received {len(image_data)}B image (+{t_received - t_start:.2f}s)")
+
+        compressed_data, media_type = compress_image(image_data)
+        image_b64 = base64.b64encode(compressed_data).decode("utf-8")
+        t_compressed = time.time()
+        print(f"walk tick: compressed to {len(compressed_data)}B (+{t_compressed - t_received:.2f}s)")
+
+        description = describe_walking_frame(image_b64, media_type)
+        t_vision = time.time()
+        print(f"walk tick: vision responded (+{t_vision - t_compressed:.2f}s, total {t_vision - t_start:.2f}s)")
+
+        is_clear = description.lower().startswith("clear")
+
+        # Only "clear" gets suppressed. A real hazard always gets spoken,
+        # even if it's the same one as last tick — if it's still there
+        # (e.g. standing near a knife or a car that hasn't moved), staying
+        # silent just because the wording repeated is exactly the wrong
+        # behavior for a safety alert.
+        if is_clear:
+            print("walk tick: skipping (clear)")
+            return StreamingResponse(iter(()), media_type="application/octet-stream")
+
+        print(f"Walking mode: {description}")
+
+        def generate():
+            t_tts_start = time.time()
+            audio_stream = elevenlabs_client.text_to_speech.convert(
+                text=description,
+                voice_id=el_voice_id,
+                model_id="eleven_turbo_v2_5",
+                output_format="pcm_16000",
+                voice_settings={"speed": speech_speed},
+            )
+            first_chunk = True
+            for chunk in audio_stream:
+                if first_chunk:
+                    print(f"walk tick: first TTS byte (+{time.time() - t_tts_start:.2f}s "
+                          f"since TTS call, total {time.time() - t_start:.2f}s)")
+                    first_chunk = False
+                yield chunk
+            print(f"walk tick: TTS stream done (total {time.time() - t_start:.2f}s)")
+
+        return StreamingResponse(generate(), media_type="application/octet-stream")
+
+    except HTTPException:
+        raise
+    except anthropic.OverloadedError:
+        # Transient — Claude is momentarily overloaded. Walking mode ticks
+        # every few seconds anyway, so just skip this one silently rather
+        # than erroring; the next tick will simply try again.
+        print("walk tick: Claude overloaded, skipping this tick")
+        return StreamingResponse(iter(()), media_type="application/octet-stream")
+    except Exception as e:
+        print(f"Error in /walk/tick: {e}")
+        raise HTTPException(status_code=500, detail={"error": str(e)})
+
+
+@app.post("/announce")
+async def announce(request: Request):
+    """Speak an arbitrary short text on the glasses (used for things like
+    the walking-mode on/off confirmation) by reusing the same pending-text
+    + streaming /response/latest mechanism as everything else."""
+    global pending_response_text
+    body = await request.body()
+    text = body.decode("utf-8").strip()
+    if text:
+        pending_response_text = text
+    return {"status": "ok"}
 
 
 @app.post("/ocr/raw")
@@ -1115,4 +1322,4 @@ async def ocr_reader(image: UploadFile = File(...), system_prompt: str = None):
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="172.20.10.4", port=8000)
+    uvicorn.run(app, host="192.168.68.51", port=8000)

@@ -16,6 +16,7 @@ for _p in ("/src", "/src/lib"):
         sys.path.append(_p)
 
 import config
+import settings
 from config import SSID, PASSWORD, BACKEND_URL
 
 VAD_FLOOR = getattr(config, "VAD_FLOOR", 70)
@@ -65,6 +66,7 @@ def init_wifi():
     print("Available networks:")
     for net in wlan.scan():
         print(net)
+    print(f"Attempting to connect to {SSID} : {PASSWORD}")
     wlan.connect(SSID, PASSWORD)
     for _ in range(30):
         if wlan.isconnected():
@@ -84,7 +86,7 @@ def init_i2s():
             0,
             sck=Pin(16),
             ws=Pin(17),
-            sd=Pin(18),
+            sd=Pin(22),
             mode=I2S.RX,
             bits=16,
             format=I2S.MONO,
@@ -180,6 +182,20 @@ def record_and_send(i2s):
 
     while True:
         led.toggle()
+
+        if not button.value():
+            print("Button pressed while listening, canceling.")
+            try:
+                post("/transcribe/reset", timeout=3).close()
+            except Exception:
+                pass
+            play_sfx(getattr(config, "SFX_BUTTON", None))
+            while not button.value():
+                time.sleep_ms(10)
+            time.sleep_ms(50)
+            led.off()
+            return
+
         try:
             n = i2s.readinto(chunk_mv)
         except Exception as e:
@@ -247,7 +263,7 @@ def record_and_send(i2s):
     try:
         try:
             import camera
-            jpeg = camera.get_camera().capture()
+            jpeg = camera.get_camera_hires().capture()
             pr = post("/task/photo", data=jpeg, timeout=10)
             pr.close()
         except Exception as e:
@@ -290,6 +306,90 @@ def play_sfx(path):
         speaker.play_file(path)
     except Exception as e:
         print("sfx (%s):" % path, e)
+
+
+WALK_INTERVALS = {3: 3.0, 5: 5.0, "ondemand": 2.0}
+
+walking_mode = False
+_walk_last_tick = 0
+
+
+def _walk_interval_seconds():
+    return WALK_INTERVALS.get(settings.get("walk_interval", 5), 5.0)
+
+
+def announce(text):
+    try:
+        post("/announce", data=text.encode(), timeout=5).close()
+        import speaker
+        speaker.play_url("/response/latest")
+    except Exception as e:
+        print("announce:", e)
+
+
+def toggle_walking_mode():
+    global walking_mode
+    walking_mode = not walking_mode
+    print("Walking mode:", walking_mode)
+    announce("Walking mode on" if walking_mode else "Walking mode off")
+
+
+def walking_mode_tick():
+    """Photo -> hazard check -> audio, all in one request. /walk/tick
+    streams the alert audio directly in its response (empty body if
+    nothing changed), so this never needs a second round trip to fetch
+    the audio separately — that extra hop is exactly what was making
+    hazard alerts feel slow."""
+    global _walk_last_tick
+    now = time.ticks_ms()
+    if time.ticks_diff(now, _walk_last_tick) < _walk_interval_seconds() * 1000:
+        return
+    _walk_last_tick = now
+    r = None
+    t0 = time.ticks_ms()
+    try:
+        import camera
+        jpeg = camera.get_camera_fast().capture()
+        t_capture = time.ticks_ms()
+        print("walk tick: captured %dB in %dms" % (len(jpeg), time.ticks_diff(t_capture, t0)))
+
+        r = post("/walk/tick", data=jpeg, timeout=20)
+        t_response = time.ticks_ms()
+        print("walk tick: got response headers after %dms" % time.ticks_diff(t_response, t_capture))
+
+        import speaker
+        speaker.play_response(r)
+        t_done = time.ticks_ms()
+        print("walk tick: playback done after %dms (total %dms)" %
+              (time.ticks_diff(t_done, t_response), time.ticks_diff(t_done, t0)))
+    except Exception as e:
+        print("walk tick:", e)
+    finally:
+        if r:
+            try:
+                r.close()
+            except Exception:
+                pass
+
+
+DOUBLE_TAP_WINDOW_MS = 750
+
+
+def wait_for_tap_pattern():
+    """Blocks briefly right after a press+release to see if a second tap
+    follows. Returns 'double' or 'single'. Adds up to DOUBLE_TAP_WINDOW_MS
+    of latency to every button press — small relative to the multi-second
+    voice round trip, and the only reliable way to distinguish tap patterns
+    on a single physical button."""
+    t0 = time.ticks_ms()
+    while time.ticks_diff(time.ticks_ms(), t0) < DOUBLE_TAP_WINDOW_MS:
+        if not button.value():
+            while not button.value():
+                time.sleep_ms(10)
+            time.sleep_ms(50)
+            return "double"
+        time.sleep_ms(10)
+    return "single"
 
 
 _thinking_stop = True
@@ -339,7 +439,8 @@ def stop_thinking_sfx():
 
 
 print("=== Clarity Glasses (Pico 2W) ===")
-play_sfx(getattr(config, "SFX_BOOT", None))
+# announce("Booting Started")
+
 
 wlan = init_wifi()
 i2s = init_i2s()
@@ -354,23 +455,34 @@ calibrate_vad(i2s)
 
 button_pressed = False
 idle_ticks = 0
-print("Ready. Press button to record.")
+print("Ready. Press button to record, double-tap to toggle walking mode.")
+play_sfx(getattr(config, "SFX_BOOT", None))
 
 while True:
     if not button.value() and not button_pressed:
         button_pressed = True
-        play_sfx(getattr(config, "SFX_BUTTON", None))
-        record_and_send(i2s)
-        print("Ready for next recording.\n")
+        while not button.value():
+            time.sleep_ms(10)
+        time.sleep_ms(30)
+
+        if wait_for_tap_pattern() == "double":
+            toggle_walking_mode()
+        else:
+            play_sfx(getattr(config, "SFX_BUTTON", None))
+            record_and_send(i2s)
+            print("Ready for next recording.\n")
         idle_ticks = 0
         time.sleep(1)
 
     if button.value():
         button_pressed = False
-        
+
     idle_ticks += 1
     if idle_ticks >= 100:
         idle_ticks = 0
         update_ambient(i2s)
+
+    if walking_mode:
+        walking_mode_tick()
 
     time.sleep(0.05)

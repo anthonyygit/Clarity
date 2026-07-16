@@ -54,6 +54,21 @@
       "name": "speed_down",
       "description": "Makes the spoken responses talk slower and remembers it for next time.",
       "trigger": "When the user asks to talk slower, slow down the speech, or similar."
+    },
+    {
+      "name": "walk_interval_3",
+      "description": "Sets walking mode's narration interval to every 3 seconds.",
+      "trigger": "When the user asks to check every 3 seconds, or set the walking interval to 3 seconds."
+    },
+    {
+      "name": "walk_interval_5",
+      "description": "Sets walking mode's narration interval to every 5 seconds.",
+      "trigger": "When the user asks to check every 5 seconds, or set the walking interval to 5 seconds."
+    },
+    {
+      "name": "walk_interval_ondemand",
+      "description": "Sets walking mode to only narrate when something meaningfully changes, instead of on a fixed timer.",
+      "trigger": "When the user asks for walking mode to only speak when needed, on demand, or as needed."
     }
   ]
 }

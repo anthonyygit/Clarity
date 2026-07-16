@@ -98,6 +98,31 @@ def _shutup():
     time.sleep_ms(100)
 
 
+def play_response(r, interruptible=False):
+    """Play audio straight from an already-open urequests response (e.g. a
+    POST whose body is streamed PCM), instead of a separate GET to fetch
+    it afterward. Does not close r — caller owns that."""
+    audio = get_speaker(16000)
+    try:
+        raw = r.raw
+        buf = bytearray(2048)
+        mv = memoryview(buf)
+        while True:
+            if interruptible and not _button.value():
+                _shutup()
+                return False
+            n = raw.readinto(mv)
+            if not n:
+                break
+            if _VOL != 256:
+                _scale(buf, n // 2, _VOL)
+            audio.write(mv[:n])
+        return True
+    except Exception as e:
+        print("speaker response error:", e)
+        return False
+
+
 def play_url(path="/response/latest"):
     audio = get_speaker(16000)
     r = None

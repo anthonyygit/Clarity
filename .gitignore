@@ -2,6 +2,7 @@
 .env
 *.env
 !.env.example
+ClarityGlasses/src/config.py
 
 # Python
 __pycache__/
@@ -26,7 +27,7 @@ test/*.HEIC
 test/*.heic
 
 # Editor / tool local state
-.claude/settings.local.json
+.claude/*
 ClarityGlasses/.claude/settings.local.json
 
 # OS

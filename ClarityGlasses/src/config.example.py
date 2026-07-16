@@ -1,4 +1,5 @@
-# Shared config for glasses code + commands
+# Copy this to config.py and fill in your real values. config.py itself is
+# gitignored since it holds WiFi passwords.
 
 # Flip this between "hotspot" and "wifi" depending on where you're testing —
 # each mode remembers its own network + backend IP, so switching is a
@@ -8,13 +9,13 @@
 # below — these drift whenever the network reassigns an address.
 NETWORK_MODE = "hotspot"  # "hotspot" or "wifi"
 
-HOTSPOT_SSID = "Anthony"
-HOTSPOT_PASSWORD = "anthonyy"
-HOTSPOT_BACKEND_URL = "http://172.20.10.4:8000"
+HOTSPOT_SSID = "your_hotspot_name"
+HOTSPOT_PASSWORD = "your_hotspot_password"
+HOTSPOT_BACKEND_URL = "http://<mac_ip_on_hotspot>:8000"
 
-WIFI_SSID = "Stan"
-WIFI_PASSWORD = "parisparis123"
-WIFI_BACKEND_URL = "http://192.168.68.51:8000"
+WIFI_SSID = "your_wifi_name"
+WIFI_PASSWORD = "your_wifi_password"
+WIFI_BACKEND_URL = "http://<mac_ip_on_wifi>:8000"
 
 if NETWORK_MODE == "hotspot":
     SSID = HOTSPOT_SSID
@@ -26,7 +27,7 @@ else:
     BACKEND_URL = WIFI_BACKEND_URL
 
 # Speaker volume: 1.0 = as-is, 0.5 = half, up to 4.0 (boosted, may clip)
-VOLUME = .5
+VOLUME = 1.0
 
 # Voice detection
 VAD_FLOOR = 35   # minimum speech threshold (lower = hears softer speech)
