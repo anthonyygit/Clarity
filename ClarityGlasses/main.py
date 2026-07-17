@@ -160,14 +160,13 @@ def send_batch(filled):
 
 
 def record_and_send(i2s):
+    global task_active
+
     if not i2s:
         print("No I2S")
         return
 
-    try:
-        post("/transcribe/reset", timeout=3).close()
-    except Exception:
-        pass
+    async_reset()
 
     total = 0
     sent = 0
@@ -175,6 +174,7 @@ def record_and_send(i2s):
     heard_speech = False
     speech_ms = 0
     silence_ms = 0
+    speech_streak = 0  # consecutive above-threshold chunks, not just one
     read_fail_streak = 0
     t0 = time.ticks_ms()
 
@@ -185,10 +185,7 @@ def record_and_send(i2s):
 
         if not button.value():
             print("Button pressed while listening, canceling.")
-            try:
-                post("/transcribe/reset", timeout=3).close()
-            except Exception:
-                pass
+            async_reset()
             play_sfx(getattr(config, "SFX_BUTTON", None))
             while not button.value():
                 time.sleep_ms(10)
@@ -215,8 +212,16 @@ def record_and_send(i2s):
         if level > SPEECH_THRESHOLD:
             heard_speech = True
             speech_ms += 250
-            silence_ms = 0
+            speech_streak += 1
+            # Only a genuine run of loud chunks (500ms+) counts as speech
+            # resuming and resets the silence clock. A single noisy chunk
+            # (breathing, a bump, background blip) shouldn't be able to
+            # keep the recording open forever after you've actually
+            # stopped talking — that was the "never stops listening" bug.
+            if speech_streak >= 2:
+                silence_ms = 0
         else:
+            speech_streak = 0
             silence_ms += 250
         if total % BATCH_SIZE == 0:
             print("  level=%d threshold=%d %s" % (level, SPEECH_THRESHOLD,
@@ -251,10 +256,7 @@ def record_and_send(i2s):
           % (total, total / BYTES_PER_SEC, wall, sent))
 
     if not heard_speech:
-        try:
-            post("/transcribe/reset", timeout=3).close()
-        except Exception:
-            pass
+        async_reset()
         return
 
 
@@ -281,6 +283,8 @@ def record_and_send(i2s):
     if data is None:
         return
 
+    task_active = data.get("task_active", False)
+
     print("Transcript:", data.get("transcript"))
 
     if data.get("response"):
@@ -306,6 +310,60 @@ def play_sfx(path):
         speaker.play_file(path)
     except Exception as e:
         print("sfx (%s):" % path, e)
+
+
+def async_reset():
+    """Fire the server-side buffer-clear off in the background instead of
+    blocking on it — this was adding up to 3s of silent dead air between
+    the button-click sfx and the mic loop actually starting, since
+    record_and_send() was waiting on this network round trip before even
+    beginning to read the mic."""
+    def _run():
+        try:
+            post("/transcribe/reset", timeout=3).close()
+        except Exception:
+            pass
+
+    if _thread:
+        try:
+            _thread.start_new_thread(_run, ())
+            return
+        except Exception as e:
+            print("async reset:", e)
+    _run()
+
+
+task_active = False
+_task_last_tick = 0
+TASK_TICK_INTERVAL_S = 3
+
+
+def task_mode_tick():
+    """Periodic visual check while a multistep task is active: does the
+    camera see the current step is done (e.g. holding the ingredient just
+    asked for)? If so, /task/tick auto-advances exactly like the user
+    saying 'ok' out loud and streams the transition audio directly back —
+    same one-round-trip pattern as walking mode's tick."""
+    global _task_last_tick
+    now = time.ticks_ms()
+    if time.ticks_diff(now, _task_last_tick) < TASK_TICK_INTERVAL_S * 1000:
+        return
+    _task_last_tick = now
+    r = None
+    try:
+        import camera
+        jpeg = camera.get_camera_hires().capture()
+        r = post("/task/tick", data=jpeg, timeout=20)
+        import speaker
+        speaker.play_response(r)
+    except Exception as e:
+        print("task tick:", e)
+    finally:
+        if r:
+            try:
+                r.close()
+            except Exception:
+                pass
 
 
 WALK_INTERVALS = {3: 3.0, 5: 5.0, "ondemand": 2.0}
@@ -484,5 +542,8 @@ while True:
 
     if walking_mode:
         walking_mode_tick()
+
+    if task_active:
+        task_mode_tick()
 
     time.sleep(0.05)

@@ -6,7 +6,7 @@
 # ever fails, check the Mac's current IP on that network (ipconfig getifaddr
 # en0, or whatever interface is active) and update the matching *_BACKEND_URL
 # below — these drift whenever the network reassigns an address.
-NETWORK_MODE = "hotspot"  # "hotspot" or "wifi"
+NETWORK_MODE = "wifi"  # "hotspot" or "wifi"
 
 HOTSPOT_SSID = "Anthony"
 HOTSPOT_PASSWORD = "anthonyy"
