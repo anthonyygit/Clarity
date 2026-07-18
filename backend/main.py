@@ -70,6 +70,88 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --- Debug-panel stats: per-HTTP-route timing (all requests, via middleware
+# below) and per-operation timing (individual AI calls, via _timed_threadpool)
+# — purely observational, never touched by the glasses.
+_server_start_time = time.time()
+_stats_lock = threading.Lock()
+_route_stats = collections.defaultdict(
+    lambda: {"count": 0, "errors": 0, "total_ms": 0.0, "min_ms": None, "max_ms": None, "last_ms": None, "last_at": None}
+)
+_command_stats = collections.defaultdict(
+    lambda: {"count": 0, "errors": 0, "total_ms": 0.0, "min_ms": None, "max_ms": None, "last_ms": None, "last_at": None}
+)
+
+# Last time any non-debug endpoint was hit successfully — used to infer
+# whether the glasses are currently online.
+last_glasses_contact = None
+GLASSES_CONTACT_TIMEOUT_S = 15
+_DEBUG_PATH_PREFIX = "/debug"
+
+
+def _record_stat(stats_dict, key, elapsed_ms, error=False):
+    with _stats_lock:
+        s = stats_dict[key]
+        s["count"] += 1
+        if error:
+            s["errors"] += 1
+        s["total_ms"] += elapsed_ms
+        s["last_ms"] = elapsed_ms
+        s["last_at"] = time.time()
+        if s["min_ms"] is None or elapsed_ms < s["min_ms"]:
+            s["min_ms"] = elapsed_ms
+        if s["max_ms"] is None or elapsed_ms > s["max_ms"]:
+            s["max_ms"] = elapsed_ms
+
+
+def _stats_summary(stats_dict):
+    with _stats_lock:
+        return {
+            key: {
+                "count": s["count"],
+                "errors": s["errors"],
+                "avg_ms": round(s["total_ms"] / s["count"], 1) if s["count"] else 0,
+                "min_ms": round(s["min_ms"], 1) if s["min_ms"] is not None else None,
+                "max_ms": round(s["max_ms"], 1) if s["max_ms"] is not None else None,
+                "last_ms": round(s["last_ms"], 1) if s["last_ms"] is not None else None,
+                "last_at": s["last_at"],
+            }
+            for key, s in sorted(stats_dict.items())
+        }
+
+
+async def _timed_threadpool(stat_key, fn, *args, **kwargs):
+    """Like run_in_threadpool, but records timing + error count under
+    stat_key in _command_stats for the debug panel."""
+    t0 = time.time()
+    try:
+        result = await run_in_threadpool(fn, *args, **kwargs)
+        _record_stat(_command_stats, stat_key, (time.time() - t0) * 1000)
+        return result
+    except Exception:
+        _record_stat(_command_stats, stat_key, (time.time() - t0) * 1000, error=True)
+        raise
+
+
+@app.middleware("http")
+async def stats_middleware(request: Request, call_next):
+    global last_glasses_contact
+    start = time.time()
+    path = request.url.path
+    is_debug_path = path.startswith(_DEBUG_PATH_PREFIX)
+    try:
+        response = await call_next(request)
+        elapsed_ms = (time.time() - start) * 1000
+        _record_stat(_route_stats, path, elapsed_ms, error=response.status_code >= 500)
+        if not is_debug_path and response.status_code < 500:
+            last_glasses_contact = time.time()
+        return response
+    except Exception:
+        elapsed_ms = (time.time() - start) * 1000
+        _record_stat(_route_stats, path, elapsed_ms, error=True)
+        raise
+
+
 anthropic_client = Anthropic()
 elevenlabs_client = ElevenLabs(api_key=os.getenv("ELEVENLABS_API_KEY"))
 
@@ -815,6 +897,10 @@ def compress_image(image_data: bytes, max_size_mb: float = 9) -> tuple[bytes, st
     img = Image.open(io.BytesIO(image_data))
     max_bytes = int(max_size_mb * 1024 * 1024)
 
+    # Camera is mounted rotated 90 degrees clockwise, so correct it here —
+    # the single choke point every image-consuming endpoint passes through.
+    img = img.rotate(-90, expand=True)
+
     if img.width > 4096 or img.height > 4096:
         img.thumbnail((4096, 4096), Image.Resampling.LANCZOS)
 
@@ -912,7 +998,7 @@ async def transcribe_done():
 
         # Can block for up to ~2.5s (finalize wait + thread join) — must
         # not run directly on the event loop.
-        transcript = await run_in_threadpool(finish_live_transcription)
+        transcript = await _timed_threadpool("live_transcription_finalize", finish_live_transcription)
         if transcript:
             print(f"Live transcript: {transcript!r}")
         else:
@@ -920,7 +1006,9 @@ async def transcribe_done():
                 deepgram = DeepgramClient(api_key=deepgram_api_key)
                 with open(wav_path, "rb") as f:
                     wav_bytes = f.read()
-                response = deepgram.listen.v1.media.transcribe_file(
+                response = await _timed_threadpool(
+                    "batch_transcription",
+                    deepgram.listen.v1.media.transcribe_file,
                     request=wav_bytes,
                     model="nova-2",
                     smart_format=True,
@@ -960,11 +1048,11 @@ async def transcribe_done():
                         "walk_interval_ondemand": "Okay, I'll only speak up when something changes.",
                     }[settings_command]
                 elif active_task is not None:
-                    response_text = await run_in_threadpool(continue_task, transcript)
+                    response_text = await _timed_threadpool("continue_task", continue_task, transcript)
                 else:
-                    command, response_text = await run_in_threadpool(interpret_command, transcript)
+                    command, response_text = await _timed_threadpool("interpret_command", interpret_command, transcript)
                     if command == "start_task":
-                        response_text = await run_in_threadpool(start_task, transcript)
+                        response_text = await _timed_threadpool("start_task", start_task, transcript)
                         command = "none"
                     elif command == "speed_up":
                         adjust_speech_speed(SPEED_STEP)
@@ -1024,7 +1112,8 @@ async def scene_from_glasses(request: Request):
         compressed_data, media_type = compress_image(image_data)
         image_b64 = base64.b64encode(compressed_data).decode("utf-8")
 
-        message = await run_in_threadpool(
+        message = await _timed_threadpool(
+            "scene_raw_vision",
             anthropic_client.messages.create,
             model="claude-sonnet-5",
             max_tokens=200,
@@ -1092,7 +1181,7 @@ async def walk_tick(request: Request):
         t_compressed = time.time()
         print(f"walk tick: compressed to {len(compressed_data)}B (+{t_compressed - t_received:.2f}s)")
 
-        description = await run_in_threadpool(describe_walking_frame, image_b64, media_type)
+        description = await _timed_threadpool("walk_tick_vision", describe_walking_frame, image_b64, media_type)
         t_vision = time.time()
         print(f"walk tick: vision responded (+{t_vision - t_compressed:.2f}s, total {t_vision - t_start:.2f}s)")
 
@@ -1172,7 +1261,7 @@ async def task_tick(request: Request):
         idx = active_task["step_index"]
         current_step = steps[idx]
 
-        verdict = await run_in_threadpool(check_task_ready, image_b64, media_type, current_step)
+        verdict = await _timed_threadpool("task_tick_vision", check_task_ready, image_b64, media_type, current_step)
         print(f"task tick: step {idx + 1}/{len(steps)} verdict={verdict!r}")
 
         if "ready" not in verdict:
@@ -1180,7 +1269,7 @@ async def task_tick(request: Request):
 
         print("task tick: visually ready, auto-advancing")
         last_task_photo = image_data
-        response_text = await run_in_threadpool(continue_task, "okay, I'm ready, done with this step")
+        response_text = await _timed_threadpool("continue_task", continue_task, "okay, I'm ready, done with this step")
 
         def generate():
             audio_stream = elevenlabs_client.text_to_speech.convert(
@@ -1237,7 +1326,8 @@ async def ocr_from_glasses(request: Request):
         compressed_data, media_type = compress_image(image_data)
         image_b64 = base64.b64encode(compressed_data).decode("utf-8")
 
-        message = await run_in_threadpool(
+        message = await _timed_threadpool(
+            "ocr_raw_vision",
             anthropic_client.messages.create,
             model="claude-sonnet-5",
             max_tokens=1000,
@@ -1544,6 +1634,20 @@ async def debug_state():
             "history_length": len(active_task.get("history", [])),
         }
 
+    now = time.time()
+    glasses_connected = (
+        last_glasses_contact is not None
+        and (now - last_glasses_contact) < GLASSES_CONTACT_TIMEOUT_S
+    )
+
+    route_stats = _stats_summary(_route_stats)
+    command_stats = _stats_summary(_command_stats)
+    total_requests = sum(s["count"] for s in route_stats.values())
+    total_errors = sum(s["errors"] for s in route_stats.values())
+
+    with buffer_lock:
+        audio_buffer_bytes = len(audio_buffer)
+
     return {
         "active_task": task,
         "last_task_photo_pending": last_task_photo is not None,
@@ -1553,16 +1657,38 @@ async def debug_state():
         "groq_configured": groq_client is not None,
         "has_debug_image": last_debug_image is not None,
         "logs": list(_debug_log),
+
+        "uptime_s": round(now - _server_start_time, 1),
+        "glasses_connected": glasses_connected,
+        "glasses_last_seen_s_ago": (
+            round(now - last_glasses_contact, 1) if last_glasses_contact else None
+        ),
+        "audio_buffer_bytes": audio_buffer_bytes,
+        "live_deepgram_active": live_dg_client is not None,
+        "last_saved_audio_path": last_saved_audio_path,
+        "total_requests": total_requests,
+        "total_errors": total_errors,
+        "route_stats": route_stats,
+        "command_stats": command_stats,
     }
 
 
 @app.get("/debug/image")
 async def debug_image():
     """The most recent image received from any endpoint — describe_scene,
-    read_text, walking mode, take_photo, or a task photo. Debug-only."""
+    read_text, walking mode, take_photo, or a task photo. Rotated 90deg CCW
+    for display, matching the correction applied in compress_image() for the
+    camera's physical mounting. Debug-only."""
     if last_debug_image is None:
         raise HTTPException(status_code=404, detail="No image yet")
-    return Response(content=last_debug_image, media_type="image/jpeg")
+    try:
+        img = Image.open(io.BytesIO(last_debug_image))
+        img = img.rotate(-90, expand=True)
+        output = io.BytesIO()
+        img.save(output, format="JPEG", quality=80)
+        return Response(content=output.getvalue(), media_type="image/jpeg")
+    except Exception:
+        return Response(content=last_debug_image, media_type="image/jpeg")
 
 
 @app.post("/debug/clear_task")
@@ -1606,6 +1732,14 @@ async def debug_panel():
   .empty { color:#5a5a68; font-style:italic; }
   #image-wrap { display:flex; align-items:center; justify-content:center; background:#0a0a0d; border-radius:8px; min-height:180px; }
   #image-wrap img { max-width:100%; max-height:360px; border-radius:8px; display:block; }
+  table { width:100%; border-collapse:collapse; font-size:12.5px; }
+  th, td { text-align:right; padding:5px 8px; border-bottom:1px solid #22222c; }
+  th:first-child, td:first-child { text-align:left; }
+  th { color:#8a8a9a; font-weight:500; text-transform:uppercase; font-size:10.5px; letter-spacing:.04em; }
+  td.errcount { color:#ff6b6b; }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; }
+  .dot.ok { background:#5fd97a; }
+  .dot.off { background:#5a5a68; }
 </style>
 </head>
 <body>
@@ -1626,6 +1760,16 @@ async def debug_panel():
   <div class="card" style="margin-bottom:16px;">
     <h2>Latest Image</h2>
     <div id="image-wrap"><div class="empty">no image yet</div></div>
+  </div>
+  <div class="grid">
+    <div class="card">
+      <h2>Route Timings (ms)</h2>
+      <div id="route-stats"><div class="empty">loading...</div></div>
+    </div>
+    <div class="card">
+      <h2>Command / AI Call Timings (ms)</h2>
+      <div id="command-stats"><div class="empty">loading...</div></div>
+    </div>
   </div>
   <div class="card">
     <h2>Server Log</h2>
@@ -1673,13 +1817,47 @@ async function refresh() {
     taskBody.innerHTML = '<div class="empty">No active task</div>';
   }
 
+  function fmtUptime(s) {
+    const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = Math.floor(s % 60);
+    return h > 0 ? `${h}h ${m}m ${sec}s` : m > 0 ? `${m}m ${sec}s` : `${sec}s`;
+  }
+
   const stateBody = document.getElementById('state-body');
   stateBody.innerHTML = `
+    <div class="row"><span class="label">Glasses connectivity</span><span class="val"><span class="dot ${data.glasses_connected ? 'ok' : 'off'}"></span>${data.glasses_connected ? 'online' : 'offline'}${data.glasses_last_seen_s_ago != null ? ` (last seen ${data.glasses_last_seen_s_ago.toFixed(0)}s ago)` : ' (never seen)'}</span></div>
+    <div class="row"><span class="label">Server uptime</span><span class="val">${fmtUptime(data.uptime_s)}</span></div>
+    <div class="row"><span class="label">Total requests / errors</span><span class="val">${data.total_requests} / <span class="${data.total_errors ? 'errcount' : ''}">${data.total_errors}</span></span></div>
     <div class="row"><span class="label">Speech speed</span><span class="val">${data.speech_speed} (range ${data.speed_range[0]}–${data.speed_range[1]})</span></div>
     <div class="row"><span class="label">Groq configured</span><span class="val ${data.groq_configured ? 'ok' : 'off'}">${data.groq_configured ? 'yes' : 'no (Claude fallback only)'}</span></div>
+    <div class="row"><span class="label">Live Deepgram connection</span><span class="val ${data.live_deepgram_active ? 'ok' : 'off'}">${data.live_deepgram_active ? 'open' : 'idle'}</span></div>
+    <div class="row"><span class="label">Audio buffer</span><span class="val">${data.audio_buffer_bytes} bytes</span></div>
     <div class="row"><span class="label">Task photo pending</span><span class="val">${data.last_task_photo_pending ? 'yes' : 'no'}</span></div>
+    <div class="row"><span class="label">Last recording saved</span><span class="val">${data.last_saved_audio_path ? esc(data.last_saved_audio_path) : '(none)'}</span></div>
     <div class="row"><span class="label">Pending response text</span><span class="val">${data.pending_response_text ? esc(data.pending_response_text) : '(none)'}</span></div>
   `;
+
+  function renderStatsTable(stats) {
+    const keys = Object.keys(stats);
+    if (!keys.length) return '<div class="empty">no calls yet</div>';
+    let rows = '';
+    keys.forEach(k => {
+      const s = stats[k];
+      const agoS = s.last_at ? (Date.now() / 1000 - s.last_at) : null;
+      rows += `<tr>
+        <td>${esc(k)}</td>
+        <td>${s.count}</td>
+        <td class="${s.errors ? 'errcount' : ''}">${s.errors}</td>
+        <td>${s.avg_ms}</td>
+        <td>${s.min_ms ?? '—'}</td>
+        <td>${s.max_ms ?? '—'}</td>
+        <td>${agoS != null ? agoS.toFixed(0) + 's ago' : '—'}</td>
+      </tr>`;
+    });
+    return `<table><thead><tr><th>Key</th><th>Count</th><th>Err</th><th>Avg</th><th>Min</th><th>Max</th><th>Last</th></tr></thead><tbody>${rows}</tbody></table>`;
+  }
+
+  document.getElementById('route-stats').innerHTML = renderStatsTable(data.route_stats || {});
+  document.getElementById('command-stats').innerHTML = renderStatsTable(data.command_stats || {});
 
   const imageWrap = document.getElementById('image-wrap');
   if (data.has_debug_image) {
@@ -1706,6 +1884,6 @@ if __name__ == "__main__":
     import uvicorn
 
     if mode == "wifi":
-     uvicorn.run(app, host="192.168.68.51", port=8000)
+     uvicorn.run(app, host="192.168.1.2", port=8000)
     elif mode == "hotspot":
         uvicorn.run(app, host="172.20.10.4", port=8000)
