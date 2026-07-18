@@ -1,24 +1,19 @@
-# Secrets
 .env
 *.env
 !.env.example
 ClarityGlasses/src/config.py
 
-# Python
 __pycache__/
 *.pyc
 *.pyo
 venv/
 .venv/
 
-# Backend runtime data (recordings/photos/generated responses, not source)
 backend/logs/
 backend/settings.json
 
-# Glasses runtime data (only ever exists on-device, but just in case)
 ClarityGlasses/src/settings.json
 
-# Large personal test fixtures, not source
 test/*.png
 test/*.jpg
 test/*.jpeg
@@ -26,9 +21,7 @@ test/*.wav
 test/*.HEIC
 test/*.heic
 
-# Editor / tool local state
 .claude/*
 ClarityGlasses/.claude/settings.local.json
 
-# OS
 .DS_Store

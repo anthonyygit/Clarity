@@ -21,6 +21,7 @@ from PIL import Image
 import io
 from deepgram import DeepgramClient
 from groq import Groq
+import typesense
 import threading
 import time
 
@@ -32,9 +33,6 @@ except ImportError:
 
 load_dotenv()
 
-# Captures every existing print() call app-wide into a ring buffer, purely
-# for the debug panel — doesn't touch any of the print() call sites
-# themselves, just tees stdout. Local/debug-only, never sent to the glasses.
 _debug_log = collections.deque(maxlen=300)
 mode = "wifi"
 
@@ -51,10 +49,6 @@ class _TeeStdout:
         self._original.flush()
 
     def __getattr__(self, name):
-        # Proxy everything else (isatty, fileno, encoding, ...) straight
-        # through — uvicorn's own logging setup inspects stdout directly,
-        # so this needs to be indistinguishable from the real thing for
-        # anything we don't explicitly override above.
         return getattr(self._original, name)
 
 
@@ -70,9 +64,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Debug-panel stats: per-HTTP-route timing (all requests, via middleware
-# below) and per-operation timing (individual AI calls, via _timed_threadpool)
-# — purely observational, never touched by the glasses.
 _server_start_time = time.time()
 _stats_lock = threading.Lock()
 _route_stats = collections.defaultdict(
@@ -82,8 +73,6 @@ _command_stats = collections.defaultdict(
     lambda: {"count": 0, "errors": 0, "total_ms": 0.0, "min_ms": None, "max_ms": None, "last_ms": None, "last_at": None}
 )
 
-# Last time any non-debug endpoint was hit successfully — used to infer
-# whether the glasses are currently online.
 last_glasses_contact = None
 GLASSES_CONTACT_TIMEOUT_S = 15
 _DEBUG_PATH_PREFIX = "/debug"
@@ -230,10 +219,17 @@ if not elevenlabs_api_key:
 if not deepgram_api_key:
     raise ValueError("DEEPGRAM_API_KEY environment variable not set")
 
-# Optional — only used to speed up walking mode's hazard checks. Not
-# required at startup like the others, since /walk/tick falls back to
-# Claude automatically if this isn't set or a call to it fails.
 groq_client = Groq(api_key=groq_api_key) if groq_api_key else None
+
+typesense_client = typesense.Client({
+    "nodes": [{
+        "host": os.getenv("TYPESENSE_HOST", "localhost"),
+        "port": os.getenv("TYPESENSE_PORT", "443"),
+        "protocol": os.getenv("TYPESENSE_PROTOCOL", "https"),
+    }],
+    "api_key": os.getenv("TYPESENSE_API_KEY", "not_configured"),
+    "connection_timeout_seconds": 5,
+})
 
 audio_buffer = bytearray()
 buffer_lock = threading.Lock()
@@ -245,17 +241,27 @@ pending_response_text = None
 active_task = None
 last_task_photo = None
 
-# Most recent image received from any endpoint (scene, ocr, walking mode,
-# task photo, take_photo) — purely for the debug panel to display, so you
-# can see exactly what the camera last captured.
+rigged_mode = 0
+rigged_pending_start = False
+rigged_advance_pending = False
+
+RIGGED_LINE_2 = "Small lobby seating nook: two patterned armchairs on beige carpet, a city-lights photo on the wall to your left, and an open doorway ahead leading to a lounge with a stone fireplace and dark wood floors."
+
+RIGGED_TASK_1 = {
+    "task_name": "hotel coffee",
+    "intro": "Got it, looks like you've got everything out.",
+    "steps": [
+        "First, grab an empty cup from the tray on the far left of the counter.",
+        "Now move right to the coffee airpots. The first one, closest to you, is labeled Regular Coffee — press the lever at its base to pour, and hold it for about 3 seconds.",
+
+        "That should be enough. Just to the left of the coffee airpots is a white pump bottle of creamer with a red top — press it a couple times into your cup.",
+        "Lids are back on the left side of the counter, on the second tray next to the cups — put one on.",
+    ],
+    "sign_off": "You're all set, enjoy your coffee.",
+}
+
 last_debug_image = None
 
-# Live Deepgram transcription, run alongside the existing buffered/batch
-# path (never replacing it). Every stage is wrapped so any failure here
-# just leaves live_dg_client as None, and /transcribe/done transparently
-# falls back to the proven batch transcribe_file() call on the full
-# recording — this can never make transcription worse than it was before,
-# only sometimes faster.
 live_dg_ctx = None
 live_dg_client = None
 live_dg_reader_thread = None
@@ -571,7 +577,98 @@ def load_commands() -> list:
         return []
 
 
+TYPESENSE_COMMANDS_COLLECTION = "commands"
+typesense_ready = False
+
+
+TYPESENSE_MAX_VECTOR_DISTANCE = 0.8
+
+
+def sync_typesense_commands():
+    """(Re)builds the commands collection from commands.json. Called once at
+    startup — cheap and small, so drop + recreate is simpler than diffing.
+    Uses Typesense's built-in auto-embedding (semantic vector search)
+    instead of plain keyword search — these command descriptions are long
+    prose and spoken commands are paraphrased, so literal token overlap
+    matches poorly (e.g. "read this to me" sharing no exact words with the
+    read_text entry); embeddings match on meaning instead."""
+    global typesense_ready
+    commands = load_commands()
+    schema = {
+        "name": TYPESENSE_COMMANDS_COLLECTION,
+        "fields": [
+            {"name": "cmd_name", "type": "string"},
+            {"name": "trigger", "type": "string"},
+            {
+                "name": "embedding",
+                "type": "float[]",
+                "embed": {
+                    "from": ["trigger"],
+                    "model_config": {"model_name": "ts/all-MiniLM-L12-v2"},
+                },
+            },
+        ],
+    }
+    try:
+        try:
+            typesense_client.collections[TYPESENSE_COMMANDS_COLLECTION].delete()
+        except Exception:
+            pass
+        typesense_client.collections.create(schema)
+        docs = [
+            {
+                "id": c["name"],
+                "cmd_name": c["name"],
+                "trigger": c["trigger"],
+            }
+            for c in commands
+        ]
+        if docs:
+            typesense_client.collections[TYPESENSE_COMMANDS_COLLECTION].documents.import_(
+                docs, {"action": "upsert"}
+            )
+        typesense_ready = True
+        print(f"[typesense] indexed {len(docs)} commands")
+    except Exception as e:
+        typesense_ready = False
+        print(f"[typesense] setup failed, command routing will fall back to 'none': {e}")
+
+
+sync_typesense_commands()
+
+
+def pick_command_typesense(transcript: str) -> str:
+    """Replaces Claude for the command-picking decision: semantic vector
+    search (via Typesense's auto-embedding) against the indexed
+    commands.json entries, taking the top hit if it's close enough. Falls
+    back to 'none' if Typesense isn't reachable, nothing matches, or the
+    closest hit is too far to be a real match — the caller treats that the
+    same as no command."""
+    if not typesense_ready:
+        return "none"
+    try:
+        results = typesense_client.collections[TYPESENSE_COMMANDS_COLLECTION].documents.search({
+            "q": transcript,
+            "query_by": "embedding",
+        })
+    except Exception as e:
+        print(f"[typesense] search failed: {e}")
+        return "none"
+    hits = results.get("hits", [])
+    if not hits:
+        return "none"
+    top = hits[0]
+    distance = top.get("vector_distance")
+    if distance is not None and distance > TYPESENSE_MAX_VECTOR_DISTANCE:
+        return "none"
+    return top["document"]["cmd_name"]
+
+
 def interpret_command(transcript: str) -> tuple[str, str]:
+    """Typesense decides WHICH command matched (replacing Claude for that
+    part); Claude is only used afterward to word the spoken response —
+    including writing the actual scene description / read-aloud text
+    directly when a photo is attached, same as before."""
     import json
 
     global last_task_photo
@@ -580,11 +677,11 @@ def interpret_command(transcript: str) -> tuple[str, str]:
     if not commands:
         return "none", ""
 
-    command_list = "\n".join(
-        f"- {c['name']}: {c['description']} Trigger: {c['trigger']}"
-        for c in commands
-    )
     valid_names = {c["name"] for c in commands}
+
+    command = pick_command_typesense(transcript)
+    if command not in valid_names:
+        command = "none"
 
     content = []
     has_photo = False
@@ -611,8 +708,8 @@ def interpret_command(transcript: str) -> tuple[str, str]:
         max_tokens=1000 if has_photo else 150,
         system=(
             "You are the voice assistant inside smart glasses for a blind user. "
-            "Given a transcript of what they said, decide which command they want to run.\n\n"
-            f"Available commands:\n{command_list}\n\n"
+            f"A command-matching system has already determined the matched command "
+            f"is: {command!r} (or 'none' if nothing matched).\n\n"
             + (
                 "A photo from the glasses' camera is attached, showing what the user "
                 "is currently looking at.\n"
@@ -626,9 +723,10 @@ def interpret_command(transcript: str) -> tuple[str, str]:
                 "acknowledgment as usual.\n\n"
                 if has_photo else ""
             )
-            + "Also write a short, upbeat spoken confirmation (one sentence, cheerful and "
-            "friendly,). If no command matches, the "
-            "response should cheerfully say you didn't catch a command. Be creative with your response, mix it up every time! Dont be repetetive."
+            + "Write a short, upbeat spoken confirmation (one sentence, cheerful and "
+            "friendly) for the matched command above. If the matched command is "
+            "'none', cheerfully say you didn't catch a command. Be creative with your "
+            "response, mix it up every time! Don't be repetitive."
         ),
         messages=[{"role": "user", "content": content}],
         output_config={
@@ -637,10 +735,9 @@ def interpret_command(transcript: str) -> tuple[str, str]:
                 "schema": {
                     "type": "object",
                     "properties": {
-                        "command": {"type": "string"},
                         "response": {"type": "string"},
                     },
-                    "required": ["command", "response"],
+                    "required": ["response"],
                     "additionalProperties": False,
                 },
             }
@@ -649,11 +746,7 @@ def interpret_command(transcript: str) -> tuple[str, str]:
 
     text = next((b.text for b in message.content if b.type == "text"), "{}")
     data = json.loads(text)
-    command = data.get("command", "none").strip().lower()
     response = data.get("response", "")
-
-    if command not in valid_names:
-        command = "none"
 
     if has_photo and command in ("describe_scene", "read_text"):
         command = "none"
@@ -897,8 +990,6 @@ def compress_image(image_data: bytes, max_size_mb: float = 9) -> tuple[bytes, st
     img = Image.open(io.BytesIO(image_data))
     max_bytes = int(max_size_mb * 1024 * 1024)
 
-    # Camera is mounted rotated 90 degrees clockwise, so correct it here —
-    # the single choke point every image-consuming endpoint passes through.
     img = img.rotate(-90, expand=True)
 
     if img.width > 4096 or img.height > 4096:
@@ -947,17 +1038,6 @@ async def transcribe_chunk(request: Request):
 
             print(f"[CHUNK] +{chunk_size:5}B | Total: {total:7}B ({duration:.2f}s)")
 
-        # feed_live_transcription is a quick, already-buffered socket write
-        # (fast), so it's fine to await — but start_live_transcription opens
-        # a whole websocket handshake to Deepgram, which can take 1-3+
-        # seconds depending on network conditions. Awaiting that here would
-        # delay this response by that whole amount, and the mic's DMA
-        # buffer on the glasses only holds ~2s before it starts dropping
-        # audio — so this is fired off in the background instead of
-        # awaited. feed_live_transcription() already no-ops safely if the
-        # connection isn't up yet (live_dg_client still None), so worst
-        # case the live path just starts a beat late; the batch fallback
-        # always has the complete audio regardless.
         if is_first_chunk:
             asyncio.create_task(run_in_threadpool(start_live_transcription))
         await run_in_threadpool(feed_live_transcription, chunk)
@@ -965,11 +1045,6 @@ async def transcribe_chunk(request: Request):
         return {"status": "buffered", "size": len(audio_buffer)}
 
     except ClientDisconnect:
-        # The glasses dropped this chunk's connection mid-send (WiFi blip) —
-        # not a server error. Close the live Deepgram socket now instead of
-        # leaving it to sit idle and hit Deepgram's own inactivity timeout
-        # later, which just produces noisy 1011 errors for no benefit; the
-        # batch transcription fallback in /transcribe/done covers the gap.
         print("transcribe chunk: client disconnected mid-send, dropping this chunk")
         await run_in_threadpool(abandon_live_transcription)
         raise HTTPException(status_code=499, detail={"error": "client disconnected"})
@@ -996,8 +1071,6 @@ async def transcribe_done():
         wav_path = save_audio_as_wav(audio_data)
         last_saved_audio_path = wav_path
 
-        # Can block for up to ~2.5s (finalize wait + thread join) — must
-        # not run directly on the event loop.
         transcript = await _timed_threadpool("live_transcription_finalize", finish_live_transcription)
         if transcript:
             print(f"Live transcript: {transcript!r}")
@@ -1023,7 +1096,12 @@ async def transcribe_done():
 
         command = "none"
         response_text = ""
-        if transcript and not transcript.startswith("["):
+        rigged_task_active = (
+            rigged_mode == 1 and active_task is not None and active_task.get("rigged")
+        )
+        if rigged_task_active:
+            print(f"Transcript: {transcript!r} -> ignored (rigged mode active)")
+        elif transcript and not transcript.startswith("["):
             try:
                 settings_command = match_settings_command(transcript)
                 if settings_command == "speed_up":
@@ -1187,11 +1265,6 @@ async def walk_tick(request: Request):
 
         is_clear = description.lower().startswith("clear")
 
-        # Only "clear" gets suppressed. A real hazard always gets spoken,
-        # even if it's the same one as last tick — if it's still there
-        # (e.g. standing near a knife or a car that hasn't moved), staying
-        # silent just because the wording repeated is exactly the wrong
-        # behavior for a safety alert.
         if is_clear:
             print("walk tick: skipping (clear)")
             return StreamingResponse(iter(()), media_type="application/octet-stream")
@@ -1221,9 +1294,6 @@ async def walk_tick(request: Request):
     except HTTPException:
         raise
     except anthropic.OverloadedError:
-        # Transient — Claude is momentarily overloaded. Walking mode ticks
-        # every few seconds anyway, so just skip this one silently rather
-        # than erroring; the next tick will simply try again.
         print("walk tick: Claude overloaded, skipping this tick")
         return StreamingResponse(iter(()), media_type="application/octet-stream")
     except Exception as e:
@@ -1292,6 +1362,70 @@ async def task_tick(request: Request):
     except Exception as e:
         print(f"Error in /task/tick: {e}")
         raise HTTPException(status_code=500, detail={"error": str(e)})
+
+
+@app.get("/rigged/tick")
+async def rigged_tick():
+    """Always-polled, no-photo, lightweight endpoint — the glasses have no
+    other way to learn that an admin started/advanced a rigged task from the
+    debug panel, since the server can't push to them. Empty body unless
+    there's something to say. Voice/vision play no part in rigged mode; the
+    debug panel button (/debug/rigged_button) is the only thing that sets
+    rigged_pending_start / rigged_advance_pending."""
+    global active_task, rigged_pending_start, rigged_advance_pending
+
+    if rigged_mode == 0:
+        return StreamingResponse(iter(()), media_type="application/octet-stream")
+
+    response_text = None
+
+    if rigged_mode == 2:
+        if rigged_advance_pending:
+            rigged_advance_pending = False
+            response_text = RIGGED_LINE_2
+            print("[rigged] mode 2: spoke line")
+    elif rigged_pending_start:
+        rigged_pending_start = False
+        active_task = {
+            "task_name": RIGGED_TASK_1["task_name"],
+            "steps": RIGGED_TASK_1["steps"],
+            "step_index": 0,
+            "history": [],
+            "rigged": True,
+        }
+        response_text = f"{RIGGED_TASK_1['intro']} {RIGGED_TASK_1['steps'][0]}".strip()
+        print("[rigged] task 1 started")
+
+    elif rigged_advance_pending and active_task is not None and active_task.get("rigged"):
+        rigged_advance_pending = False
+        steps = active_task["steps"]
+        idx = active_task["step_index"] + 1
+        if idx >= len(steps):
+            response_text = RIGGED_TASK_1["sign_off"]
+            active_task = None
+            print("[rigged] task 1 complete")
+        else:
+            active_task["step_index"] = idx
+            response_text = steps[idx]
+            print(f"[rigged] advanced to step {idx + 1}/{len(steps)}")
+    else:
+        rigged_advance_pending = False
+
+    if not response_text:
+        return StreamingResponse(iter(()), media_type="application/octet-stream")
+
+    def generate():
+        audio_stream = elevenlabs_client.text_to_speech.convert(
+            text=response_text,
+            voice_id=el_voice_id,
+            model_id="eleven_turbo_v2_5",
+            output_format="pcm_16000",
+            voice_settings={"speed": speech_speed},
+        )
+        for chunk in audio_stream:
+            yield chunk
+
+    return StreamingResponse(generate(), media_type="application/octet-stream")
 
 
 @app.post("/announce")
@@ -1632,6 +1766,7 @@ async def debug_state():
             ),
             "steps": active_task.get("steps"),
             "history_length": len(active_task.get("history", [])),
+            "rigged": bool(active_task.get("rigged")),
         }
 
     now = time.time()
@@ -1670,6 +1805,7 @@ async def debug_state():
         "total_errors": total_errors,
         "route_stats": route_stats,
         "command_stats": command_stats,
+        "rigged_mode": rigged_mode,
     }
 
 
@@ -1700,6 +1836,43 @@ async def debug_clear_task():
     last_task_photo = None
     print(f"[debug] task context cleared (was {'active' if had_task else 'already empty'})")
     return {"status": "cleared", "had_task": had_task}
+
+
+@app.post("/debug/rigged")
+async def debug_set_rigged(request: Request):
+    """Set rigged mode. Body: {"rigged": 0, 1, or 2}."""
+    global rigged_mode, rigged_pending_start, rigged_advance_pending
+    body = await request.json()
+    mode = body.get("rigged")
+    rigged_mode = mode if mode in (0, 1, 2) else 0
+    rigged_pending_start = False
+    rigged_advance_pending = False
+    print(f"[rigged] mode set to {rigged_mode}")
+    return {"rigged": rigged_mode}
+
+
+@app.post("/debug/rigged_button")
+async def debug_rigged_button():
+    """The single admin control for rigged mode:
+    - mode 1: starts task 1 if nothing's active yet, otherwise advances the
+      current step.
+    - mode 2: speaks RIGGED_LINE_2 every press, no state.
+    Picked up by the glasses' always-on /rigged/tick poll, not delivered
+    directly."""
+    global rigged_pending_start, rigged_advance_pending
+    if rigged_mode == 2:
+        rigged_advance_pending = True
+        print("[rigged] mode 2 line requested")
+        return {"status": "line_requested"}
+    if rigged_mode != 1:
+        return {"status": "ignored", "reason": "rigged mode is off"}
+    if active_task is None:
+        rigged_pending_start = True
+        print("[rigged] start requested")
+        return {"status": "start_requested"}
+    rigged_advance_pending = True
+    print("[rigged] advance requested")
+    return {"status": "advance_requested"}
 
 
 @app.get("/debug", response_class=HTMLResponse)
@@ -1758,6 +1931,14 @@ async def debug_panel():
     </div>
   </div>
   <div class="card" style="margin-bottom:16px;">
+    <h2>Rigged Mode (scripted demo)</h2>
+    <div id="rigged-body"><div class="empty">loading...</div></div>
+    <div style="margin-top:12px; display:flex; gap:8px;">
+      <button id="rigged-toggle-btn" onclick="toggleRigged()">Rigged mode</button>
+      <button id="rigged-advance-btn" onclick="riggedButton()">Start / Continue</button>
+    </div>
+  </div>
+  <div class="card" style="margin-bottom:16px;">
     <h2>Latest Image</h2>
     <div id="image-wrap"><div class="empty">no image yet</div></div>
   </div>
@@ -1781,6 +1962,28 @@ async function clearTask() {
   const btn = document.getElementById('clear-btn');
   btn.disabled = true;
   await fetch('/debug/clear_task', {method: 'POST'});
+  btn.disabled = false;
+  refresh();
+}
+
+async function toggleRigged() {
+  const btn = document.getElementById('rigged-toggle-btn');
+  btn.disabled = true;
+  const current = parseInt(btn.dataset.rigged || '0', 10);
+  const next = (current + 1) % 3;
+  await fetch('/debug/rigged', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({rigged: next}),
+  });
+  btn.disabled = false;
+  refresh();
+}
+
+async function riggedButton() {
+  const btn = document.getElementById('rigged-advance-btn');
+  btn.disabled = true;
+  await fetch('/debug/rigged_button', {method: 'POST'});
   btn.disabled = false;
   refresh();
 }
@@ -1816,6 +2019,18 @@ async function refresh() {
   } else {
     taskBody.innerHTML = '<div class="empty">No active task</div>';
   }
+
+  const riggedBody = document.getElementById('rigged-body');
+  const toggleBtn = document.getElementById('rigged-toggle-btn');
+  const advanceBtn = document.getElementById('rigged-advance-btn');
+  const modeLabels = {0: '0 — normal', 1: '1 — scripted task', 2: '2 — single line'};
+  toggleBtn.dataset.rigged = data.rigged_mode;
+  toggleBtn.textContent = `Rigged mode: ${modeLabels[data.rigged_mode]} (click to cycle)`;
+  advanceBtn.textContent = data.rigged_mode === 2 ? 'Speak line' : 'Start / Continue (rigged)';
+  riggedBody.innerHTML = `
+    <div class="row"><span class="label">Mode</span><span class="val"><span class="dot ${data.rigged_mode ? 'ok' : 'off'}"></span>${modeLabels[data.rigged_mode]}</span></div>
+    <div class="row"><span class="label">Rigged task running</span><span class="val">${data.active_task && data.active_task.rigged ? 'yes' : 'no'}</span></div>
+  `;
 
   function fmtUptime(s) {
     const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = Math.floor(s % 60);

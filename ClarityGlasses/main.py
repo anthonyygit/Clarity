@@ -174,7 +174,7 @@ def record_and_send(i2s):
     heard_speech = False
     speech_ms = 0
     silence_ms = 0
-    speech_streak = 0  # consecutive above-threshold chunks, not just one
+    speech_streak = 0
     read_fail_streak = 0
     t0 = time.ticks_ms()
 
@@ -213,11 +213,6 @@ def record_and_send(i2s):
             heard_speech = True
             speech_ms += 250
             speech_streak += 1
-            # Only a genuine run of loud chunks (500ms+) counts as speech
-            # resuming and resets the silence clock. A single noisy chunk
-            # (breathing, a bump, background blip) shouldn't be able to
-            # keep the recording open forever after you've actually
-            # stopped talking — that was the "never stops listening" bug.
             if speech_streak >= 2:
                 silence_ms = 0
         else:
@@ -366,6 +361,29 @@ def task_mode_tick():
                 pass
 
 
+_rigged_last_tick = 0
+RIGGED_TICK_INTERVAL_S = 1.5
+
+
+def rigged_tick():
+    """Always-on, no-photo poll for rigged (scripted demo) mode. The server
+    can't push to the glasses, so this is the only way they learn that an
+    admin started/advanced a rigged task from the debug panel — cheap
+    enough (no camera, tiny request) to run continuously regardless of
+    whether rigged mode is even on; the server just replies empty when
+    there's nothing to say."""
+    global _rigged_last_tick
+    now = time.ticks_ms()
+    if time.ticks_diff(now, _rigged_last_tick) < RIGGED_TICK_INTERVAL_S * 1000:
+        return
+    _rigged_last_tick = now
+    try:
+        import speaker
+        speaker.play_url("/rigged/tick")
+    except Exception as e:
+        print("rigged tick:", e)
+
+
 WALK_INTERVALS = {3: 3.0, 5: 5.0, "ondemand": 2.0}
 
 walking_mode = False
@@ -497,7 +515,6 @@ def stop_thinking_sfx():
 
 
 print("=== Clarity Glasses (Pico 2W) ===")
-# announce("Booting Started")
 
 
 wlan = init_wifi()
@@ -545,5 +562,7 @@ while True:
 
     if task_active:
         task_mode_tick()
+
+    rigged_tick()
 
     time.sleep(0.05)
